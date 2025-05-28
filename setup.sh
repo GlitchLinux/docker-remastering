@@ -83,7 +83,7 @@ dpkg-reconfigure -f noninteractive tzdata
 
 # Configure keyboard (US layout)
 echo "XKBMODEL=\"pc105\"" > /etc/default/keyboard
-echo "XKBLAYOUT=\"us\"" >> /etc/default/keyboard
+echo "XKBLAYOUT=\"se\"" >> /etc/default/keyboard
 echo "XKBVARIANT=\"\"" >> /etc/default/keyboard
 echo "XKBOPTIONS=\"\"" >> /etc/default/keyboard
 dpkg-reconfigure -f noninteractive keyboard-configuration
@@ -101,17 +101,6 @@ systemctl enable ssh
 # Configure firewall
 ufw allow ssh
 ufw enable
-
-# Configure automatic updates
-echo 'APT::Periodic::Update-Package-Lists "1";' > /etc/apt/apt.conf.d/20auto-upgrades
-echo 'APT::Periodic::Unattended-Upgrade "1";' >> /etc/apt/apt.conf.d/20auto-upgrades
-echo 'Unattended-Upgrade::Automatic-Reboot "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-echo 'Unattended-Upgrade::Automatic-Reboot-Time "02:00";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-
-# Create a non-root user with sudo privileges
-useradd -m -s /bin/bash admin
-echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin
-chmod 440 /etc/sudoers.d/admin
 
 # Install cloud-init for cloud compatibility (even if not using cloud)
 cat > /etc/cloud/cloud.cfg.d/99_defaults.cfg <<EOF
@@ -141,4 +130,123 @@ apt-get install -y \
     bzip2 \
     lzop \
     p7zip-full \
-   
+    nano
+
+
+#!/bin/bash
+
+# Ensure script is run as root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run as root" >&2
+    exit 1
+fi
+
+# Function to validate username
+validate_username() {
+    local username="$1"
+    if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        echo "Invalid username: must start with lowercase letter or underscore, and contain only lowercase letters, digits, underscores, or hyphens" >&2
+        return 1
+    fi
+    if id -u "$username" &>/dev/null; then
+        echo "User '$username' already exists" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Function to validate hostname
+validate_hostname() {
+    local hostname="$1"
+    if [[ ! "$hostname" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]$ ]]; then
+        echo "Invalid hostname: must be 2-63 characters, alphanumeric with hyphens (but not at start/end)" >&2
+        return 1
+    fi
+    if [[ "$hostname" =~ ^[0-9]+$ ]]; then
+        echo "Invalid hostname: cannot be all numbers" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Prompt for username
+while true; do
+    read -rp "Enter new username: " username
+    if validate_username "$username"; then
+        break
+    fi
+done
+
+# Prompt for password (twice for verification)
+while true; do
+    read -rsp "Enter password for $username: " password
+    echo
+    read -rsp "Confirm password: " password_confirm
+    echo
+    
+    if [ -z "$password" ]; then
+        echo "Password cannot be empty" >&2
+    elif [ "$password" != "$password_confirm" ]; then
+        echo "Passwords do not match" >&2
+    else
+        break
+    fi
+done
+
+# Prompt for new hostname
+current_hostname=$(hostname)
+echo "Current hostname is: $current_hostname"
+while true; do
+    read -rp "Enter new hostname: " new_hostname
+    if validate_hostname "$new_hostname"; then
+        break
+    fi
+done
+
+# Create the user
+echo "Creating user $username..."
+adduser --gecos "" --disabled-password "$username"
+echo "$username:$password" | chpasswd
+
+# Add user to sudo group
+echo "Adding $username to sudo group..."
+usermod -aG sudo "$username"
+
+# Change hostname
+echo "Changing hostname to $new_hostname..."
+hostnamectl set-hostname "$new_hostname"
+sed -i "/^127.0.1.1/c\127.0.1.1\t$new_hostname" /etc/hosts
+sysctl kernel.hostname="$new_hostname"
+
+# Configure sudo without password (optional)
+echo "Configuring passwordless sudo for $username..."
+echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$username"
+chmod 440 "/etc/sudoers.d/90-$username"
+
+# Display summary
+echo -e "\n=== Setup Complete ==="
+echo "Username: $username"
+echo "Hostname: $(hostname)"
+echo "Sudo access: Enabled (passwordless)"
+echo "User groups: $(groups "$username")"
+
+# Verify sudo access
+echo -e "\nTesting sudo access..."
+su - "$username" -c 'sudo whoami'
+
+echo -e "\nYou can now login as $username with the password you set."
+
+cd /
+sudo wget https://raw.githubusercontent.com/GlitchLinux/gLiTcH-ToolKit/refs/heads/main/apps
+sudo chmod +x apps && sudo chmod 777 apps
+cp apps /home && cp apps /home/x && cp apps /root 
+
+cd /tmp
+wget https://glitchlinux.wtf/FILES/refractasnapshot-base_10.2.12_all.deb
+wget https://glitchlinux.wtf/FILES/live-config-refracta_0.0.5.deb
+wget https://glitchlinux.wtf/FILES/live-boot-initramfs-tools_20221008~fsr1_all.deb
+wget https://glitchlinux.wtf/FILES/live-boot_20221008~fsr1_all.deb
+
+sudo dpkg --force-all -i live-boot_20221008~fsr1_all.deb live-boot-initramfs-tools_20221008~fsr1_all.deb live-config-refracta_0.0.5.deb refractasnapshot-base_10.2.12_all.deb
+sudo apt install -f
+sudo dpkg --configure -a
