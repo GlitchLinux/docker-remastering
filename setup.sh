@@ -68,6 +68,10 @@ apt-get install -y --no-install-recommends \
     btrfs-progs \
     xfsprogs \
 
+#Kernel modules
+sudo apt update
+sudo apt install --reinstall linux-image-amd64 linux-headers-amd64
+
 # Configure locales
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
