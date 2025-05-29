@@ -10,20 +10,21 @@ error_exit() {
 check_dependencies() {
     local missing=()
     ! command -v sshpass &>/dev/null && missing+=("sshpass")
+    ! command -v pv &>/dev/null && missing+=("pv")  # For progress tracking
     [ ${#missing[@]} -gt 0 ] && error_exit "Missing packages: ${missing[*]}\nInstall with: sudo apt install ${missing[*]}"
 }
 
 # Function to test SSH connection
 test_connection() {
-    echo -n "Testing SSH connection... "
+    echo -n "Testing SSH connection to $host... "
     if ! sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "exit" &>/dev/null; then
         echo "FAILED"
-        error_exit "Connection failed. Check credentials and try again."
+        error_exit "Connection failed. Check:\n1. Credentials\n2. Server reachability\n3. SSH service\n4. Firewall rules for port $port"
     fi
     echo "OK"
 }
 
-# Function to transfer with progress
+# Function to transfer with reliable progress
 transfer_file() {
     local src="$1"
     local dest="$2"
@@ -32,47 +33,47 @@ transfer_file() {
     
     echo -e "\nTransferring ${src##*/} ($(numfmt --to=iec-i --suffix=B $size))"
     echo "Destination: $host:$dest"
-    
-    # Create progress pipe
-    mkfifo /tmp/transfer_progress
-    (
-        while true; do
-            read -r current < /tmp/transfer_progress
-            [ "$current" = "DONE" ] && break
-            printf "\rProgress: [%-50s] %d%%" \
-                   "$(printf '#%.0s' $(seq 1 $((current*50/size))))" \
-                   $((current*100/size))
-        done
-    ) &
-    
-    # Transfer file
+
     if [ "$use_sudo" = true ]; then
-        sshpass -p "$password" ssh -p "$port" "$username@$host" "mkdir -p '$temp_dir'"
-        dd if="$src" 2>/dev/null | \
-        sshpass -p "$password" ssh -p "$port" "$username@$host" \
-            "cat > '$temp_dir/${src##*/}'; \
-             sudo mkdir -p '$(dirname "$dest")' && \
-             sudo mv '$temp_dir/${src##*/}' '$dest' && \
-             sudo rm -rf '$temp_dir'"
+        echo "Using sudo for transfer..."
+        # Create temp directory
+        if ! sshpass -p "$password" ssh -p "$port" "$username@$host" "mkdir -p '$temp_dir'"; then
+            error_exit "Failed to create temp directory on remote"
+        fi
+
+        # Transfer with progress
+        if ! pv -pet -s $size "$src" | \
+           sshpass -p "$password" ssh -p "$port" "$username@$host" "cat > '$temp_dir/${src##*/}'"; then
+            error_exit "Failed to transfer file to temp location"
+        fi
+
+        # Move with sudo
+        if ! sshpass -p "$password" ssh -p "$port" "$username@$host" \
+            "sudo mkdir -p '$(dirname "$dest")' && \
+             sudo cp '$temp_dir/${src##*/}' '$dest' && \
+             sudo rm -rf '$temp_dir'"; then
+            error_exit "Failed to move file with sudo"
+        fi
     else
-        dd if="$src" 2>/dev/null | \
-        sshpass -p "$password" ssh -p "$port" "$username@$host" \
-            "mkdir -p '$(dirname "$dest")' && cat > '$dest'"
+        echo "Direct transfer..."
+        if ! pv -pet -s $size "$src" | \
+           sshpass -p "$password" ssh -p "$port" "$username@$host" \
+           "mkdir -p '$(dirname "$dest")' && cat > '$dest'"; then
+            error_exit "Direct transfer failed"
+        fi
     fi
-    
-    # Cleanup
-    echo "DONE" > /tmp/transfer_progress
-    wait
-    rm -f /tmp/transfer_progress
-    echo -e "\rTransfer completed successfully! $(tput el)"
+
+    echo -e "\nTransfer completed successfully!"
 }
 
 # Main script
 main() {
     # Check for ISO files
     iso_files=(/home/snapshot/snapshot-*.iso)
-    [ ${#iso_files[@]} -eq 0 ] && error_exit "No snapshot ISO files found in /home/snapshot/"
-    
+    if [ ${#iso_files[@]} -eq 0 ]; then
+        error_exit "No snapshot ISO files found in /home/snapshot/"
+    fi
+
     # Select ISO file
     echo "Available snapshot ISOs:"
     PS3="Select a file (1-${#iso_files[@]}): "
@@ -80,58 +81,57 @@ main() {
         [ -n "$iso" ] && break
         echo "Invalid selection. Try again."
     done
-    
-    # Copy to root
-    echo -e "\nSelected: ${iso##*/}"
-    sudo cp -v "$iso" / || error_exit "Failed to copy ISO to root"
-    
-    # Rename ISO
-    while true; do
-        read -p "Enter new name (without .iso extension): " new_name
-        new_name=$(echo "$new_name" | tr -d '[:space:]')
-        [ -z "$new_name" ] && echo "Name cannot be empty" && continue
-        [[ "$new_name" =~ [/\\] ]] && echo "Invalid characters" && continue
-        break
-    done
-    
-    sudo mv -v "/${iso##*/}" "/$new_name.iso" || error_exit "Failed to rename ISO"
-    local iso_path="/$new_name.iso"
-    
+
+    # Verify ISO exists
+    [ ! -f "$iso" ] && error_exit "Selected ISO file not found: $iso"
+
+    # Copy to root with timestamp
+    new_name="custom_$(date +%Y%m%d_%H%M).iso"
+    echo -e "\nCopying ${iso##*/} to /$new_name"
+    sudo cp -v "$iso" "/$new_name" || error_exit "Failed to copy ISO to root"
+    local iso_path="/$new_name"
+
     # SSH transfer setup
     check_dependencies
-    
+
     # Get credentials
     while true; do
         read -p "SSH credentials (user@host): " credentials
         [[ "$credentials" =~ ^[^@]+@[^@]+$ ]] && break
-        echo "Format: user@host"
+        echo "Invalid format. Use: username@hostname"
     done
     username=${credentials%%@*}
     host=${credentials#*@}
-    
+
     read -s -p "Password: " password
     echo
     [ -z "$password" ] && error_exit "Password required"
-    
-    read -p "SSH port [22]: " port
-    port=${port:-22}
-    
+
+    while true; do
+        read -p "SSH port [22]: " port
+        port=${port:-22}
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] && [ "$port" -lt 65536 ] && break
+        echo "Invalid port number (1-65535)"
+    done
+
     test_connection
-    
+
     # Destination path
     while true; do
         read -p "Remote destination path: " dest_path
+        dest_path=$(echo "$dest_path" | sed 's:/*$::')  # Remove trailing slashes
         [ -n "$dest_path" ] && break
-        echo "Path required"
+        echo "Destination path required"
     done
-    
+
     # Check for system directories
     use_sudo=false
-    [[ "$dest_path" =~ ^/(etc|usr|lib|var|bin|sbin|opt|root|boot) ]] && \
-        read -p "System directory detected. Use sudo? [y/N]: " sudo_confirm && \
+    if [[ "$dest_path" =~ ^/(etc|usr|lib|var|bin|sbin|opt|root|boot) ]]; then
+        read -p "System directory detected. Use sudo? [y/N]: " sudo_confirm
         [[ "$sudo_confirm" =~ ^[Yy]$ ]] && use_sudo=true
-    
-    # Confirm and transfer
+    fi
+
+    # Confirm transfer
     echo -e "\n=== Transfer Summary ==="
     echo "File: ${iso_path##*/}"
     echo "Size: $(numfmt --to=iec-i --suffix=B $(stat -c %s "$iso_path"))"
@@ -139,17 +139,29 @@ main() {
     echo "To: $host:$dest_path"
     echo "SSH Port: $port"
     [ "$use_sudo" = true ] && echo "Privilege: sudo"
-    
+
     read -p "Confirm transfer? [y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
-    
+
     transfer_file "$iso_path" "$dest_path" "$use_sudo"
-    
-    # Verify
+
+    # Verify transfer
     echo -n "Verifying transfer... "
     remote_size=$(sshpass -p "$password" ssh -p "$port" "$username@$host" \
         "stat -c %s '$dest_path' 2>/dev/null || echo 0")
-    [ "$remote_size" -eq $(stat -c %s "$iso_path") ] && echo "Success!" || echo "Size mismatch!"
+    local_size=$(stat -c %s "$iso_path")
+    
+    if [ "$remote_size" -eq "$local_size" ]; then
+        echo "Success! File sizes match."
+    else
+        echo "WARNING: Size mismatch!"
+        echo "Local size:  $(numfmt --to=iec-i --suffix=B $local_size)"
+        echo "Remote size: $(numfmt --to=iec-i --suffix=B $remote_size)"
+    fi
+
+    # Cleanup
+    read -p "Delete local copy $iso_path? [y/N]: " cleanup
+    [[ "$cleanup" =~ ^[Yy]$ ]] && sudo rm -v "$iso_path"
 }
 
 main
